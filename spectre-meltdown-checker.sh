@@ -95,13 +95,13 @@ __echo()
 {
 	opt="$1"
 	shift
-	msg="$@"
+	_msg="$@"
 	if [ "$opt_no_color" = 1 ] ; then
 		# strip ANSI color codes
-		msg=$(/bin/echo -e  "$msg" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g")
+		_msg=$(/bin/echo -e  "$_msg" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g")
 	fi
 	# explicitely call /bin/echo to avoid shell builtins that might not take options
-	/bin/echo $opt -e "$msg"
+	/bin/echo $opt -e "$_msg"
 }
 
 _echo()
@@ -553,41 +553,80 @@ umount_debugfs()
 check_variant1()
 {
 	_info "\033[1;34mCVE-2017-5753 [bounds check bypass] aka 'Spectre Variant 1'\033[0m"
-	_info_nol "* Checking count of LFENCE opcodes in kernel: "
 
-	status=0
-	if [ -n "$vmlinux_err" ]; then
-		pstatus yellow UNKNOWN "$vmlinux_err"
-	else
-		if ! which objdump >/dev/null 2>&1; then
-			pstatus yellow UNKNOWN "missing 'objdump' tool, please install it, usually it's in the binutils package"
+	status=UNK
+	sysfile="/sys/devices/system/cpu/vulnerabilities/spectre_v1"
+	sys_interface_available=0
+	msg=''
+	if [ "$opt_live" = 1 -a -r "$sysfile" ]; then
+		# this kernel has the /sys interface, trust it over everything
+		_info_nol "* Checking the /sys interface for spectre_v1: "
+		sys_interface_available=1
+		if grep -qi '^not affected' "$sysfile"; then
+			# Not affected
+			msg="kernel confirms that your CPU is unaffected"
+			pstatus green YES "$msg"
+			status=OK
+		elif grep -qi '^nmitigation' "$sysfile"; then
+			# Mitigation: PTI
+			msg="kernel confirms that the mitigation is active"
+			pstatus green YES "$msg"
+			status=OK
+		elif grep -qi '^vulnerable' "$sysfile"; then
+			# Vulnerable
+			msg="kernel confirms your system is vulnerable"
+			pstatus red NO "$msg"
+			status=VULN
 		else
-			# here we disassemble the kernel and count the number of occurences of the LFENCE opcode
-			# in non-patched kernels, this has been empirically determined as being around 40-50
-			# in patched kernels, this is more around 70-80, sometimes way higher (100+)
-			# v0.13: 68 found in a 3.10.23-xxxx-std-ipv6-64 (with lots of modules compiled-in directly), which doesn't have the LFENCE patches,
-			# so let's push the threshold to 70.
-			# TODO LKML patch is starting to dump LFENCE in favor of the PAUSE opcode, we might need to check that (patch not stabilized yet)
-			nb_lfence=$(objdump -D "$vmlinux" | grep -wc lfence)
-			if [ "$nb_lfence" -lt 70 ]; then
-				pstatus red NO "only $nb_lfence opcodes found, should be >= 70"
-				status=1
+			msg="unknown value reported by kernel ("$(cat "$sysfile")")"
+			pstatus yellow UNKNOWN "$msg"
+			status=UNK
+		fi
+	else
+		# no /sys interface (or offline mode), fallback to our own ways
+		_info_nol "* Checking count of LFENCE opcodes in kernel: "
+		if [ -n "$vmlinux_err" ]; then
+			msg="couldn't check ($vmlinux_err)"
+			pstatus yellow UNKNOWN "$msg"
+			status=UNK
+		else
+			if ! which objdump >/dev/null 2>&1; then
+				msg="missing 'objdump' tool, please install it, usually it's in the binutils package"
+				pstatus yellow UNKNOWN "$msg"
+				status=UNK
 			else
-				pstatus green YES "$nb_lfence opcodes found, which is >= 70"
-				status=2
+				# here we disassemble the kernel and count the number of occurences of the LFENCE opcode
+				# in non-patched kernels, this has been empirically determined as being around 40-50
+				# in patched kernels, this is more around 70-80, sometimes way higher (100+)
+				# v0.13: 68 found in a 3.10.23-xxxx-std-ipv6-64 (with lots of modules compiled-in directly), which doesn't have the LFENCE patches,
+				# so let's push the threshold to 70.
+				nb_lfence=$(objdump -D "$vmlinux" | grep -wc lfence)
+				if [ "$nb_lfence" -lt 70 ]; then
+					pstatus red NO "only $nb_lfence opcodes found, should be >= 70"
+					msg="only $nb_lfence opcodes found, should be >= 70, heuristic to be improved when official patches become available"
+					status=VULN
+				else
+					pstatus green YES "$nb_lfence opcodes found, which is >= 70"
+					msg="$nb_lfence opcodes found, which is >= 70, heuristic to be improved when official patches become available"
+					status=OK
+				fi
 			fi
 		fi
 	fi
+	case "$status" in
+		UNK)  pstatus yellow UNKNOWN "$msg";;
+		VULN) pstatus red    NO      "$msg";;
+		OK)   pstatus green  OK      "$msg";;
+	esac
 
-	if ! is_cpu_vulnerable 1; then
-		pvulnstatus CVE-2017-5753 OK "your CPU vendor reported your CPU model as not vulnerable"
-	else
-		case "$status" in
-			0) pvulnstatus CVE-2017-5753 UNK "impossible to check ${vmlinux}";;
-			1) pvulnstatus CVE-2017-5753 VULN 'heuristic to be improved when official patches become available';;
-			2) pvulnstatus CVE-2017-5753 OK 'heuristic to be improved when official patches become available';;
-		esac
+	# if we have the /sys interface, don't even check is_cpu_vulnerable ourselves, the kernel already does it
+	if [ "$sys_interface_available" = 0 ] && ! is_cpu_vulnerable 1; then
+		msg="your CPU vendor reported your CPU model as not vulnerable"
+		status=OK
 	fi
+
+	# report status
+	pvulnstatus CVE-2017-5753 "$status" "$msg"
 }
 
 ###################
